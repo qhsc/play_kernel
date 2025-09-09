@@ -1,0 +1,28 @@
+{
+    "files.associations": {
+        "*.cjson": "jsonc",
+        "*.wxss": "css",
+        "*.wxs": "javascript",
+        ".clangd": "yaml",
+        "optional": "cpp",
+        "array": "cpp",
+        "functional": "cpp",
+        "tuple": "cpp",
+        "type_traits": "cpp",
+        "utility": "cpp",
+        "iostream": "cpp"
+    },
+    "C_Cpp.default.includePath": [
+        "${workspaceFolder}/**",
+        "/usr/include/c++/v1",
+        "/usr/local/include",
+        "/usr/include",
+        "/usr/local/cuda/include",
+        "/root/.pyenv/versions/3.12.11/lib/python3.12/site-packages/torch/include",
+        "/root/.pyenv/versions/3.12.11/lib/python3.12/site-packages/torch/include/torch/csrc/api/include"
+    ],
+    "C_Cpp.default.defines": [
+        "CUDA",
+        "CUDA_SM_90"
+    ]
+}

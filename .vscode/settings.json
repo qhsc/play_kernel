@@ -10,19 +10,24 @@
         "tuple": "cpp",
         "type_traits": "cpp",
         "utility": "cpp",
-        "iostream": "cpp"
+        "iostream": "cpp",
+        "*.cu": "cuda-cpp",
+        "*.cuh": "cuda-cpp"
     },
-    "C_Cpp.default.includePath": [
-        "${workspaceFolder}/**",
-        "/usr/include/c++/v1",
-        "/usr/local/include",
-        "/usr/include",
-        "/usr/local/cuda/include",
-        "/root/.pyenv/versions/3.12.11/lib/python3.12/site-packages/torch/include",
-        "/root/.pyenv/versions/3.12.11/lib/python3.12/site-packages/torch/include/torch/csrc/api/include"
+    // 禁用 Microsoft C/C++ 扩展，使用 clangd
+    "C_Cpp.intelliSenseEngine": "disabled",
+    "C_Cpp.autocomplete": "disabled",
+    "C_Cpp.errorSquiggles": "disabled",
+    "C_Cpp.suggestSnippets": false,
+    // clangd 配置
+    "clangd.arguments": [
+        "--background-index",
+        "--clang-tidy",
+        "--header-insertion=iwyu",
+        "--completion-style=detailed",
+        "--function-arg-placeholders",
+        "--fallback-style=llvm"
     ],
-    "C_Cpp.default.defines": [
-        "CUDA",
-        "CUDA_SM_90"
-    ]
+    "clangd.path": "clangd",
+    "editor.formatOnSave": true
 }

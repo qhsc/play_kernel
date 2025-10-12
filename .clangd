@@ -1,0 +1,47 @@
+CompileFlags:
+  Add:
+    # CUDA 相关头文件路径
+    - -I/usr/local/cuda-12.6/include
+    - -I/usr/local/cuda-12.6/targets/x86_64-linux/include
+    # PyTorch 相关头文件路径
+    - -I/root/.pyenv/versions/3.12.11/lib/python3.12/site-packages/torch/include
+    - -I/root/.pyenv/versions/3.12.11/lib/python3.12/site-packages/torch/include/torch/csrc/api/include
+    # Python 头文件路径 (用于 pybind11)
+    - -I/root/.pyenv/versions/3.12.11/include/python3.12
+    # 标准库路径
+    - -I/usr/include/c++/v1
+    - -I/usr/local/include
+    - -I/usr/include
+    # 工作区路径
+    - -I/cpfs/user/baiheng/code/play_kernel/play_kernel
+    # CUDA 相关宏定义
+    - -DCUDA
+    - -DCUDA_SM_90
+    # C++ 标准
+    - -std=c++17
+    # CUDA 相关标志
+    - --cuda-gpu-arch=sm_90
+    - --no-cuda-version-check
+    # 其他有用的标志
+    - -Wall
+    - -Wextra
+    - -Wno-unused-parameter
+    - -Wno-unused-variable
+    - -Wno-unknown-pragmas
+
+Index:
+  Background: Build
+
+Diagnostics:
+  ClangTidy:
+    Add: [performance-*, modernize-*]
+    Remove: [modernize-use-trailing-return-type]
+  UnusedIncludes: Strict
+
+InlayHints:
+  Enabled: Yes
+  ParameterNames: Yes
+  DeducedTypes: Yes
+
+Hover:
+  ShowAKA: Yes

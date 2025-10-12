@@ -160,6 +160,50 @@ __global__ void reduce_sum_bf16x8_f32_kernel(const __nv_bfloat16 *x, float *y, i
     }
 }
 
+template <const int kNumThreads>
+__global__ void reduce_sum_fp8e4m3x16_f32_kernel(const __nv_fp8_storage_t *x, float *y, int N) {
+    const int kNumWarps = kNumThreads / WARP_SIZE;
+    static_assert(kNumWarps <= WARP_SIZE, "too many threads per block");
+
+    auto tid = threadIdx.x;
+    auto idx = (blockIdx.x * kNumThreads + tid) << 4;
+    auto warp = tid / WARP_SIZE;
+    auto lane = tid % WARP_SIZE;
+
+    __shared__ std::array<float, kNumWarps> smem;
+
+    std::array<__nv_fp8_storage_t, 16> fp8_16;
+    if (int(idx) < N) {
+        LDST128(fp8_16) = LDST128_CONST(x[idx]);
+    }
+
+    // thread reduce 16 elements
+    half half_val = __float2half(0.0f);
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        if (i + int(idx) < N) {
+            half_val += __nv_cvt_fp8_to_halfraw(fp8_16[i], __NV_E4M3);
+        }
+    }
+
+    // warp-level reduce
+    float f32_val = warp_reduce_sum_f32(__half2float(half_val));
+    if (lane == 0) {
+        smem[warp] = f32_val;
+    }
+
+    // CTA level reduce from shared memory using first warp
+    __syncthreads();
+    if (warp == 0) {
+        f32_val = lane < kNumWarps ? smem[lane] : 0.0f;
+        f32_val = warp_reduce_sum_f32<WARP_SIZE>(f32_val);
+
+        if (tid == 0) {
+            atomicAdd(y, f32_val);
+        }
+    }
+}
+
 torch::Tensor reduce_sum_f32(const torch::Tensor &x) {
     const int N = x.numel();
     const int kNumThreads = 1024;
@@ -188,7 +232,19 @@ torch::Tensor reduce_sum_bf16x8_f32(const torch::Tensor &x) {
     auto opt = x.options();
     torch::Tensor out = torch::zeros({1}, opt.dtype(torch::kFloat32));
     reduce_sum_bf16x8_f32_kernel<kNumThreads>
-        <<<kNumBlocks, kNumThreads>>>(reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), out.data_ptr<float>(), N);
+        <<<kNumBlocks, kNumThreads>>>(reinterpret_cast<const __nv_bfloat16 *>(x.data_ptr()), out.data_ptr<float>(), N);
+    return out;
+}
+
+torch::Tensor reduce_sum_fp8e4m3x16_f32(const torch::Tensor &x) {
+    const int N = x.numel();
+    const int kNumThreads = 1024;
+    const int kNumBlocks = (N + kNumThreads - 1) / kNumThreads / 16;
+
+    auto opt = x.options();
+    torch::Tensor out = torch::zeros({1}, opt.dtype(torch::kFloat32));
+    reduce_sum_fp8e4m3x16_f32_kernel<kNumThreads><<<kNumBlocks, kNumThreads>>>(
+        reinterpret_cast<const __nv_fp8_storage_t *>(x.data_ptr()), out.data_ptr<float>(), N);
     return out;
 }
 
@@ -196,4 +252,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("reduce_sum_f32", &reduce_sum_f32, "Reduce Sum F32 (CUDA)");
     m.def("reduce_sum_f32x4", &reduce_sum_f32x4, "Reduce Sum F32x4 (CUDA)");
     m.def("reduce_sum_bf16x8_f32", &reduce_sum_bf16x8_f32, "Reduce Sum BF16x8 F32 (CUDA)");
+    m.def("reduce_sum_fp8e4m3x16_f32", &reduce_sum_fp8e4m3x16_f32, "Reduce Sum FP8E4M3x16 F32 (CUDA)");
 }

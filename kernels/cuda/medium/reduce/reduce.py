@@ -61,8 +61,12 @@ for S, K in SKs:
     run_benchmark(torch.sum, values, "f32f32_th")
     run_benchmark(lib.reduce_sum_f32, values, "f32f32")
     run_benchmark(lib.reduce_sum_f32x4, values, "f32x4f32")
-    
+
     v_bf16 = values.to(torch.bfloat16)
     v_bf16_2 = v_bf16.to(torch.float32)
     run_benchmark(torch.sum, v_bf16, "bf16bf16_th")
     run_benchmark(lib.reduce_sum_bf16x8_f32, v_bf16, "bf16x8f32")
+
+    v_fp8 = values.to(torch.float8_e4m3fn)
+    # run_benchmark(torch.sum, v_fp8, "fp8fp8_th")
+    run_benchmark(lib.reduce_sum_fp8e4m3x16_f32, v_fp8, "fp8x16f32")

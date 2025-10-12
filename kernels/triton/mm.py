@@ -37,7 +37,9 @@ def _mm_nt_kernel(
     mn_tiles = m_tiles * n_tiles
 
     for tile_id in tl.range(pid, mn_tiles, NUM_SM, flatten=True):
-        m_tile_idx, n_tile_idx = _schedule_tile(tile_id=tile_id, group_tiles=group_tiles, group_size_m=M_GROUP_SIZE, m_tiles=m_tiles)
+        m_tile_idx, n_tile_idx = _schedule_tile(
+            tile_id=tile_id, group_tiles=group_tiles, group_size_m=M_GROUP_SIZE, m_tiles=m_tiles
+        )
         off_m = m_tile_idx * BLOCK_SIZE_M
         off_n = n_tile_idx * BLOCK_SIZE_N
 
@@ -98,7 +100,7 @@ def bench(m, n, k):
     bytes = (m * k + n * k + m * n) * 2
     ITERS = 2000
 
-    def bench_(fn,name):
+    def bench_(fn, name):
         for _ in range(10):
             fn()
         torch.cuda.synchronize()
@@ -112,7 +114,7 @@ def bench(m, n, k):
 
     bench_(lambda: mm_nt(a, b), "triton mm_nt")
 
-    bench_(lambda: torch.einsum("mk,nk->mn", a, b), "torch.einsum")
+    # bench_(lambda: torch.einsum("mk,nk->mn", a, b), "torch.einsum")
 
 
 sanity_check()

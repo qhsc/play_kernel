@@ -12,22 +12,26 @@ CompileFlags:
     - -I/usr/include/c++/v1
     - -I/usr/local/include
     - -I/usr/include
+    - -I/usr/include/llvm-20
+    - -I/usr/include/llvm-c-20
     # 工作区路径
     - -I/cpfs/user/baiheng/code/play_kernel/play_kernel
     # CUDA 相关宏定义
     - -DCUDA
     - -DCUDA_SM_90
     # C++ 标准
-    - -std=c++17
+    - -std=c++20
     # CUDA 相关标志
     - --cuda-gpu-arch=sm_90
     - --no-cuda-version-check
+    - -D__CUDA_ARCH__=900
     # 其他有用的标志
     - -Wall
     - -Wextra
     - -Wno-unused-parameter
     - -Wno-unused-variable
     - -Wno-unknown-pragmas
+    - -xc++
 
 Index:
   Background: Build
@@ -35,7 +39,7 @@ Index:
 Diagnostics:
   ClangTidy:
     Add: [performance-*, modernize-*]
-    Remove: [modernize-use-trailing-return-type]
+    Remove: [modernize-use-trailing-return-type, modernize-avoid-c-arrays]
   UnusedIncludes: Strict
 
 InlayHints:

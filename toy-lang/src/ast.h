@@ -9,6 +9,20 @@
 
 #include "lexer.h"
 
+#include <llvm/IR/IRBuilder.h>
+#include "llvm/ADT/APFloat.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/Type.h"
+#include "llvm/IR/Value.h"
+#include "llvm/IR/Verifier.h"
+
 namespace ast {
 
 static int CurTok;
@@ -19,10 +33,13 @@ static int getNextToken() {
 class ExprAST {
    public:
     virtual ~ExprAST() = default;
+
     virtual std::string dump() const = 0;
 
-    static std::unique_ptr<ExprAST> LogError(const char *Str) {
-        fprintf(stderr, "Error: %s\n", Str);
+    virtual llvm::Value *codegen() = 0;
+
+    static std::unique_ptr<ExprAST> LogError(const char *str) {
+        fprintf(stderr, "Error: %s\n", str);
         return nullptr;
     }
 
@@ -35,6 +52,7 @@ class NumberExprAST : public ExprAST {
    public:
     NumberExprAST(double val) : val_(val) {
     }
+
     std::string dump() const override {
         return "num:" + std::to_string(val_);
     }
@@ -45,18 +63,22 @@ class NumberExprAST : public ExprAST {
         getNextToken();
         return ret;
     }
+
+    llvm::Value *codegen() override;
 };
 
 class VariableExprAST : public ExprAST {
     std::string name_;
 
    public:
-    VariableExprAST(const std::string &name) : name_(name) {
+    VariableExprAST(std::string name) : name_(std::move(name)) {
     }
 
     std::string dump() const override {
         return "var:" + name_;
     }
+
+    llvm::Value *codegen() override;
 };
 
 class BinaryExprAST : public ExprAST {
@@ -82,6 +104,8 @@ class BinaryExprAST : public ExprAST {
     std::string dump() const override {
         return "(binop:" + std::string(1, op_) + " " + lhs_->dump() + ", " + rhs_->dump() + ")";
     }
+
+    llvm::Value *codegen() override;
 };
 
 class CallExprAST : public ExprAST {
@@ -101,6 +125,8 @@ class CallExprAST : public ExprAST {
         args_str = args_str.substr(0, args_str.size() - 2);
         return "(call:" + callee_ + " " + args_str + ")";
     }
+
+    llvm::Value *codegen() override;
 };
 
 /// PrototypeAST - This class represents the "prototype" for a function,
@@ -111,7 +137,7 @@ class PrototypeAST {
     std::vector<std::string> args_;
 
    public:
-    PrototypeAST(const std::string &name, std::vector<std::string> args) : name_(name), args_(std::move(args)) {
+    PrototypeAST(std::string name, std::vector<std::string> args) : name_(std::move(name)), args_(std::move(args)) {
     }
 
     std::string dump() const {
@@ -154,6 +180,8 @@ class PrototypeAST {
         getNextToken();
         return std::make_unique<PrototypeAST>(name, std::move(args));
     }
+
+    llvm::Function *codegen();
 };
 
 /// FunctionAST - This class represents a function definition itself.
@@ -187,6 +215,8 @@ class FunctionAST {
         getNextToken();  // eat extern.
         return PrototypeAST::parse();
     }
+
+    llvm::Function *codegen();
 };
 
 static std::unique_ptr<ExprAST> parseParenExpr() {

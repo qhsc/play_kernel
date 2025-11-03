@@ -39,19 +39,17 @@ def test_cuda_ipc(rank: int, world_size: int):
 
         warm_up_loop = 100
         test_loop = 2000
-        test_sizes = [
-            6144*128* i for i in [1,2,3,4,5,6,7,8]
-        ]
-        
+        test_sizes = [int(6144 * 128 * i) for i in [0.5, 1, 2, 3, 4, 5, 6, 7, 8]]
+
         ar_custom = lambda input, output: custom_ops.all_reduce(custom_ptr, input, output, buffer_ptrs[rank], max_size)
         ar_dist = lambda input: dist.all_reduce(input, group=ctx.device_group)
-        
+
         rs_custom = lambda input, output: custom_ops.reduce_scatter(custom_ptr, input, output, buffer_ptrs[rank], max_size)
         rs_dist = lambda input, output: dist.reduce_scatter_tensor(output=output, input=input, group=ctx.device_group)
-        
+
         ag_custom = lambda input, output: custom_ops.all_gather(custom_ptr, input, output, buffer_ptrs[rank], max_size)
         ag_dist = lambda input, output: dist.all_gather_into_tensor(output_tensor=output, input_tensor=input, group=ctx.device_group)
-        
+
         def get_op(op_type: str):
             if op_type == "ar":
                 return ar_custom, ar_dist
@@ -61,7 +59,7 @@ def test_cuda_ipc(rank: int, world_size: int):
                 return ag_custom, ag_dist
             else:
                 raise ValueError(f"Invalid op type: {op_type}")
-        
+
         for op in ["ar", "rs", "ag"]:
             if rank == 0:
                 print(f"========== {op=} ==========")
@@ -70,11 +68,11 @@ def test_cuda_ipc(rank: int, world_size: int):
                     input_sz = sz if op != "ag" else sz // world_size
                     input_tensor = torch.randint(1, 16, (input_sz,), dtype=dtype, device="cuda")
                     input_backup = input_tensor.clone()
-                    
+
                     output_sz = sz if op != "rs" else sz // world_size
                     output_tensor = torch.empty((output_sz,), dtype=dtype, device="cuda")
                     output_backup = torch.empty_like(output_tensor) if op != "ar" else input_backup
-                    
+
                     op_custom, op_dist = get_op(op)
                     for i in range(warm_up_loop):
                         op_custom(input_tensor, output_tensor)
@@ -86,8 +84,7 @@ def test_cuda_ipc(rank: int, world_size: int):
                             torch.testing.assert_close(output_tensor, output_backup)
                     # if rank == 0:
                     #     print(f"Passed {op=} {sz=} check!!!")
-                    
-                    
+
                     with nvtx.annotate(f"{op=} bs={sz//6144}"):
                         torch.cuda.synchronize()
                         dist.barrier(group=ctx.device_group)
@@ -96,7 +93,7 @@ def test_cuda_ipc(rank: int, world_size: int):
                             op_custom(input_tensor, output_tensor)
                         torch.cuda.synchronize()
                         custom_time = (time.perf_counter() - start_time) / test_loop
-                        
+
                         torch.cuda.synchronize()
                         time.sleep(1)
                         dist.barrier(group=ctx.device_group)
@@ -108,12 +105,12 @@ def test_cuda_ipc(rank: int, world_size: int):
                                 op_dist(input_backup, output_backup)
                         torch.cuda.synchronize()
                         dist_time = (time.perf_counter() - start_time) / test_loop
-                        
+
                         data_size = max(input_sz, output_sz) * dtype.itemsize / 1e6 
                         comm_data_gb = max(input_sz, output_sz) * dtype.itemsize / world_size * (world_size-1) / 1e9 
                         if op == "ar":
                             comm_data_gb *= 2
-                            
+
                         comm_bw_custom = comm_data_gb / custom_time
                         comm_bw_dist = comm_data_gb / dist_time
                         if rank == 0:

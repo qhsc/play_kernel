@@ -23,7 +23,8 @@ class ParallelContext:
         self.lib = CudaRULibrary()
 
     def destroy(self):
-        torch.distributed.destroy_process_group()
+        torch.distributed.destroy_process_group(self.device_group)
+        torch.distributed.destroy_process_group(self.cpu_group)
 
     def create_shared_cuda_ipc_mem(self, size_bytes: int, group=None):
         if group is None:

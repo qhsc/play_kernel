@@ -41,13 +41,14 @@ def test_cuda_ipc(rank: int, world_size: int):
         test_loop = 2000
         test_sizes = [int(6144 * 128 * i) for i in [0.5, 1, 2, 3, 4, 5, 6, 7, 8]]
 
-
         rs_custom = lambda input, output: custom_ops.reduce_scatter(custom_ptr, input, output, buffer_ptrs[rank], max_size)
         rs_dist = lambda input, output: dist.reduce_scatter_tensor(output=output, input=input, group=ctx.device_group)
-        rs_fused_custom = lambda input, output: custom_ops.fused_reduce_scatter_norm(custom_ptr, input, output, buffer_ptrs[rank], max_size, 1e-6)
-        
+        rs_fused_custom = lambda input, output, residual: custom_ops.fused_reduce_scatter_norm(
+            custom_ptr, input, output, buffer_ptrs[rank], max_size, 1e-6, residual
+        )
+
         layer_norm = torch.nn.RMSNorm(normalized_shape=6144, eps=1e-6).cuda()
-        
+
         def rs_custom_norm(input, output):
             rs_custom(input, output)
             output = layer_norm(output)
@@ -63,16 +64,20 @@ def test_cuda_ipc(rank: int, world_size: int):
                 output_tensor = torch.zeros((output_sz//6144, 6144), dtype=dtype, device="cuda")
                 output_backup = torch.zeros_like(output_tensor)
 
-                op_custom, op_dist =  rs_fused_custom, rs_custom
+                redisual_tensor = torch.rand_like(output_tensor)
+                redisual_backup = redisual_tensor.clone()
+
                 for i in range(warm_up_loop):
-                    # op_custom(input_tensor, output_tensor)
-                    rs_fused_custom(input_tensor, output_tensor)
-                    op_dist(input_backup, output_backup)
-                    output_backup = layer_norm(output_backup)
-                    # output_backup = op_dist(input_backup, output_backup)
+                    rs_fused_custom(input_tensor, output_tensor, redisual_tensor)
+
+                    rs_custom(input_backup, output_backup)
+                    redisual_backup.add_(output_backup)
+                    output_backup = layer_norm(redisual_backup)
+
                     if i==0:
                         # print(output_tensor)
                         torch.testing.assert_close(output_tensor, output_backup)
+                        torch.testing.assert_close(redisual_tensor, redisual_backup)
                 # if rank == 0:
                 #     print(f"Passed {op=} {sz=} check!!!")
 
@@ -81,7 +86,7 @@ def test_cuda_ipc(rank: int, world_size: int):
                     dist.barrier(group=ctx.device_group)
                     start_time = time.perf_counter()
                     for _ in range(test_loop):
-                        op_custom(input_tensor, output_tensor)
+                        rs_fused_custom(input_tensor, output_tensor, redisual_tensor)
                     torch.cuda.synchronize()
                     custom_time = (time.perf_counter() - start_time) / test_loop
 
@@ -90,7 +95,9 @@ def test_cuda_ipc(rank: int, world_size: int):
                     dist.barrier(group=ctx.device_group)
                     start_time = time.perf_counter()
                     for _ in range(test_loop):
-                        op_dist(input_backup, output_backup)
+                        rs_custom(input_backup, output_backup)
+                        # redisual_backup.add_(output_backup)
+                        # output_backup = layer_norm(output_backup)
                     torch.cuda.synchronize()
                     dist_time = (time.perf_counter() - start_time) / test_loop
 

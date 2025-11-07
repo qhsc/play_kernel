@@ -57,7 +57,7 @@ bool _is_weak_contiguous(torch::Tensor& t) {
  */
 void collective_comm(
     fptr_t _fa, torch::Tensor &inp, torch::Tensor &out, fptr_t _reg_buffer, int64_t reg_buffer_sz_bytes,
-    sglang::CommOpType op_type = sglang::CommOpType::ALL_REDUCE, float eps = 1e-6) {
+    sglang::CommOpType op_type = sglang::CommOpType::ALL_REDUCE, float eps = 1e-6, torch::Tensor *residual = nullptr) {
     auto fa = reinterpret_cast<sglang::CustomAllreduce *>(_fa);
     const at::cuda::OptionalCUDAGuard device_guard(device_of(inp));
     auto stream = c10::cuda::getCurrentCUDAStream().stream();
@@ -72,6 +72,11 @@ void collective_comm(
     }
     TORCH_CHECK(_is_weak_contiguous(out));
     TORCH_CHECK(_is_weak_contiguous(inp));
+    if (residual && op_type == sglang::CommOpType::FUSED_REDUCE_SCATTER_NORM) {
+        TORCH_CHECK_EQ(residual->scalar_type(), out.scalar_type());
+        TORCH_CHECK_EQ(residual->numel(), out.numel());
+        TORCH_CHECK(_is_weak_contiguous(*residual));
+    }
     auto input_size = inp.numel() * inp.element_size();
     auto reg_buffer = reinterpret_cast<void *>(_reg_buffer);
     if (reg_buffer) {
@@ -98,9 +103,10 @@ void collective_comm(
             stream, reinterpret_cast<T *>(reg_buffer), reinterpret_cast<T *>(out.data_ptr()), num_elems_to_comm);   \
     } else if (op_type == sglang::CommOpType::FUSED_REDUCE_SCATTER_NORM) {                                          \
         int n = inp.sizes().back();                                                                                 \
+        T *residual_ptr = residual ? reinterpret_cast<T *>(residual->data_ptr()) : nullptr;                         \
         fa->collective_comm<T, sglang::CommOpType::FUSED_REDUCE_SCATTER_NORM>(                                      \
             stream, reinterpret_cast<T *>(reg_buffer), reinterpret_cast<T *>(out.data_ptr()), num_elems_to_comm, 0, \
-            64, n, eps);                                                                                            \
+            64, n, eps, residual_ptr);                                                                              \
     }
 
     switch (out.scalar_type()) {
@@ -136,9 +142,12 @@ void all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, fptr_t _reg_
 }
 
 void fused_reduce_scatter_norm(
-    fptr_t _fa, torch::Tensor &inp, torch::Tensor &out, fptr_t _reg_buffer, int64_t reg_buffer_sz_bytes, double eps) {
+    fptr_t _fa, torch::Tensor &inp, torch::Tensor &out, fptr_t _reg_buffer, int64_t reg_buffer_sz_bytes, double eps,
+    c10::optional<torch::Tensor> residual = c10::nullopt) {
+    torch::Tensor *residual_ptr = residual.has_value() && residual->defined() ? &residual.value() : nullptr;
     return collective_comm(
-        _fa, inp, out, _reg_buffer, reg_buffer_sz_bytes, sglang::CommOpType::FUSED_REDUCE_SCATTER_NORM, float(eps));
+        _fa, inp, out, _reg_buffer, reg_buffer_sz_bytes, sglang::CommOpType::FUSED_REDUCE_SCATTER_NORM, float(eps),
+        residual_ptr);
 }
 
 void dispose(fptr_t _fa) {
@@ -202,7 +211,7 @@ TORCH_LIBRARY_FRAGMENT(my_ar, m) {
 
   m.def(
       "fused_reduce_scatter_norm(int fa, Tensor inp, Tensor! out, int reg_buffer, "
-      "int reg_buffer_sz_bytes, float eps) -> ()");
+      "int reg_buffer_sz_bytes, float eps, Tensor? residual=None) -> ()");
   m.impl("fused_reduce_scatter_norm", torch::kCUDA, &fused_reduce_scatter_norm);
 
   m.def("all_gather(int fa, Tensor inp, Tensor! out, int reg_buffer, "

@@ -17,7 +17,7 @@
 
 namespace sglang {
 
-constexpr int kMaxBlocks = 36;
+constexpr int kMaxBlocks = 64;
 // Counter may overflow, but it's fine since unsigned int overflow is
 // well-defined behavior.
 using FlagType = uint32_t;
@@ -200,10 +200,116 @@ DINLINE P packed_reduce(const P* ptrs[], int idx) {
   return downcast<P>(tmp);
 }
 
+template <typename T, int N>
+DINLINE void packed_scale(array_t<T, N> &dst, const array_t<float, N> &src, const float scale) {
+#pragma unroll
+    for (int i = 0; i < N; i++) {
+        if constexpr (std::is_same<T, float>::value) {
+            dst.data[i] = src.data[i] * scale;
+        } else {
+            dst.data[i] = downcast_s<T>(src.data[i] * scale);
+        }
+    }
+}
+
+template <int N>
+DINLINE float squared_sum(array_t<float, N> &a) {
+    float sum = 0;
+#pragma unroll
+    for (int i = 0; i < N; i++) {
+        sum += a.data[i] * a.data[i];
+    }
+    return sum;
+}
+
+template <typename P, int ngpus, typename A>
+DINLINE float packed_reduce_and_squared_sum(const P *ptrs[], int src_offset, A *dst, int dst_offset) {
+    A tmp = upcast(ptrs[0][src_offset]);
+#pragma unroll
+    for (int i = 1; i < ngpus; i++) {
+        packed_assign_add(tmp, upcast(ptrs[i][src_offset]));
+    }
+    *(dst + dst_offset) = tmp;
+    return squared_sum(tmp);
+}
+
+DINLINE float warp_reduce_sum(float val) {
+#pragma unroll
+    for (int mask = WARP_SIZE - 1; mask >= 1; mask >>= 1) {
+        val += __shfl_xor_sync(0xffffffff, val, mask);
+    }
+    return val;
+}
+
+DINLINE float block_reduce_sum(float *shared_sum, float val, int num_warps, int lane_id, int warp_id) {
+    val = warp_reduce_sum(val);
+    if (lane_id == 0) {
+        shared_sum[warp_id] = val;
+    }
+    __syncthreads();
+    if (warp_id == 0) {
+        val = warp_reduce_sum(lane_id < num_warps ? shared_sum[lane_id] : 0.0f);
+        if (lane_id == 0) {
+            shared_sum[0] = val;
+        }
+    }
+    __syncthreads();
+    return shared_sum[0];
+}
+
+template <typename T, int ngpus, int MAX_WARPS = WARP_SIZE>
+__global__ void fused_reduce_scatter_norm(
+    RankData *_dp, RankSignals sg, Signal *self_sg, T *__restrict__ result, int rank, int m, int packed_n, float eps) {
+    using P = typename packed_t<T>::P;
+    using A = typename packed_t<T>::A;
+    const int n = packed_n * P::size;
+    const int part = m / ngpus;
+    const int start = rank * part;
+    const int end = rank == ngpus - 1 ? m : start + part;
+
+    const int m_stride = gridDim.x;
+    const int packed_n_stride = blockDim.x;
+    const int num_warps = blockDim.x / WARP_SIZE;
+
+    const int lane_id = threadIdx.x % WARP_SIZE;
+    const int warp_id = threadIdx.x / WARP_SIZE;
+
+    extern __shared__ float shmem[];
+    float *data_buf = shmem + CEILDIV(num_warps, 4) * 4;
+
+    const P *ptrs[ngpus];
+#pragma unroll
+    for (int i = 0; i < ngpus; i++) {
+        int target = (rank + i) % ngpus;
+        ptrs[i] = (const P *)_dp->ptrs[target];
+    }
+
+    multi_gpu_barrier<ngpus, true>(sg, self_sg, rank);
+
+    P *dst = (P *)result;
+    A *buff = (A *)data_buf;
+    for (int m_id = blockIdx.x + start; m_id < end; m_id += m_stride) {
+        float local_sum = 0;
+        int m_offset = m_id * packed_n;
+        int dst_m_offset = (m_id - start) * packed_n;
+        for (int packed_n_id = threadIdx.x; packed_n_id < packed_n; packed_n_id += packed_n_stride) {
+            local_sum += packed_reduce_and_squared_sum<P, ngpus, A>(ptrs, m_offset + packed_n_id, buff, packed_n_id);
+        }
+        float global_sum = block_reduce_sum(shmem, local_sum, num_warps, lane_id, warp_id);
+        float rms_inv = rsqrtf(global_sum / float(n) + eps);
+        for (int packed_n_id = threadIdx.x; packed_n_id < packed_n; packed_n_id += packed_n_stride) {
+            packed_scale(dst[dst_m_offset + packed_n_id], buff[packed_n_id], rms_inv);
+        }
+    }
+
+    multi_gpu_barrier<ngpus, false, true>(sg, self_sg, rank);
+}
+
 enum class CommOpType {
-  ALL_REDUCE,
-  REDUCE_SCATTER,
-  ALL_GATHER,
+    ALL_REDUCE,
+    REDUCE_SCATTER,
+    ALL_GATHER,
+    FUSED_REDUCE_SCATTER_NORM,
 };
 
 template <typename T, int ngpus, CommOpType _>
@@ -432,65 +538,78 @@ class CustomAllreduce {
    * take a small amount of SMs. Not quite sure the underlying reason, but my
    * guess is that too many SMs will cause contention on NVLink bus.
    */
-  template <typename T, CommOpType op_type=CommOpType::ALL_REDUCE>
-  void collective_comm(cudaStream_t stream, T* input, T* output, int size, int threads = 512, int block_limit = 36) {
-    auto d = packed_t<T>::P::size;
-    if (size % d != 0)
-      throw std::runtime_error(
-          "custom collective_comm currently requires input length to be multiple "
-          "of " +
-          std::to_string(d));
-    if (block_limit > kMaxBlocks)
-      throw std::runtime_error(
-          "max supported block limit is " + std::to_string(kMaxBlocks) + ". Got " + std::to_string(block_limit));
+  template <typename T, CommOpType op_type = CommOpType::ALL_REDUCE>
+  void collective_comm(
+      cudaStream_t stream, T *input, T *output, int size, int threads = 512, int block_limit = 36, int n = 1,
+      float eps = 1e-6) {
+      auto d = packed_t<T>::P::size;
+      if (size % d != 0)
+          throw std::runtime_error(
+              "custom collective_comm currently requires input length to be multiple "
+              "of "
+              + std::to_string(d));
+      if (block_limit > kMaxBlocks)
+          throw std::runtime_error(
+              "max supported block limit is " + std::to_string(kMaxBlocks) + ". Got " + std::to_string(block_limit));
 
-    RankData* ptrs;
-    cudaStreamCaptureStatus status;
-    CHECK_CUDA_SUCCESS(cudaStreamIsCapturing(stream, &status));
-    if (status == cudaStreamCaptureStatusActive) {
-      ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
-      graph_unreg_buffers_.push_back(input);
-    } else {
-      auto it = buffers_.find(input);
-      if (it == buffers_.end())
-        throw std::runtime_error(
-            "buffer address " + std::to_string(reinterpret_cast<uint64_t>(input)) + " is not registered!");
-      ptrs = it->second;
-    }
+      RankData *ptrs;
+      cudaStreamCaptureStatus status;
+      CHECK_CUDA_SUCCESS(cudaStreamIsCapturing(stream, &status));
+      if (status == cudaStreamCaptureStatusActive) {
+          ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
+          graph_unreg_buffers_.push_back(input);
+      } else {
+          auto it = buffers_.find(input);
+          if (it == buffers_.end())
+              throw std::runtime_error(
+                  "buffer address " + std::to_string(reinterpret_cast<uint64_t>(input)) + " is not registered!");
+          ptrs = it->second;
+      }
 
-    size /= d;
-    auto bytes = size * sizeof(typename packed_t<T>::P);
-    int blocks = std::min(block_limit, (size + threads - 1) / threads);
+      size /= d;
+      auto bytes = size * sizeof(typename packed_t<T>::P);
+      int blocks = std::min(block_limit, (size + threads - 1) / threads);
 #define KL(ngpus, name) name<T, ngpus, op_type><<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
     // TODO(hanzhi713): Threshold is different for A100 and H100.
     // Add per device threshold.
-#define REDUCE_CASE(ngpus)                                                                        \
-  case ngpus: {                                                                                   \
-    if (op_type != CommOpType::ALL_REDUCE){                                                       \
-      KL(ngpus, cross_device_reduce_2stage);                                                      \
-    } else if (world_size_ == 2 ) {                                                               \
-      KL(ngpus, cross_device_reduce_1stage);                                                      \
-    } else if (full_nvlink_) {                                                                    \
-      if ((world_size_ <= 4 && bytes < 512 * 1024) || (world_size_ <= 8 && bytes < 256 * 1024)) { \
-        KL(ngpus, cross_device_reduce_1stage);                                                    \
-      } else {                                                                                    \
-        KL(ngpus, cross_device_reduce_2stage);                                                    \
-      }                                                                                           \
-    }                                                                                             \
-    break;                                                                                        \
-  }
+#define REDUCE_CASE(ngpus)                                                                                           \
+  case ngpus:                                                                                                        \
+      {                                                                                                              \
+          if (op_type == CommOpType::FUSED_REDUCE_SCATTER_NORM) {                                                    \
+              constexpr int MAX_WARPS = WARP_SIZE;                                                                   \
+              int m = size * d / n;                                                                                  \
+              int packed_n = n / d;                                                                                  \
+              int _blocks = std::min(block_limit, CEILDIV(m, world_size_));                                          \
+              int _threads = std::min(MAX_WARPS * WARP_SIZE, CEILDIV(packed_n, WARP_SIZE) * WARP_SIZE);              \
+              int _warps = _threads / WARP_SIZE;                                                                     \
+              int _smem_size = (CEILDIV(_warps, 4) * 4 + n) * sizeof(float);                                         \
+              fused_reduce_scatter_norm<T, ngpus>                                                                    \
+                  <<<_blocks, _threads, _smem_size, stream>>>(ptrs, sg_, self_sg_, output, rank_, m, packed_n, eps); \
+          } else if (op_type != CommOpType::ALL_REDUCE) {                                                            \
+              KL(ngpus, cross_device_reduce_2stage);                                                                 \
+          } else if (world_size_ == 2) {                                                                             \
+              KL(ngpus, cross_device_reduce_1stage);                                                                 \
+          } else if (full_nvlink_) {                                                                                 \
+              if ((world_size_ <= 4 && bytes < 512 * 1024) || (world_size_ <= 8 && bytes < 256 * 1024)) {            \
+                  KL(ngpus, cross_device_reduce_1stage);                                                             \
+              } else {                                                                                               \
+                  KL(ngpus, cross_device_reduce_2stage);                                                             \
+              }                                                                                                      \
+          }                                                                                                          \
+          break;                                                                                                     \
+      }
 
-    switch (world_size_) {
-      REDUCE_CASE(2)
-      REDUCE_CASE(4)
-      REDUCE_CASE(6)
-      REDUCE_CASE(8)
+      switch (world_size_) {
+          REDUCE_CASE(2)
+          REDUCE_CASE(4)
+          REDUCE_CASE(6)
+          REDUCE_CASE(8)
       default:
         throw std::runtime_error(
             "custom allreduce only supports num gpus in (2,4,6,8). Actual num "
             "gpus = " +
             std::to_string(world_size_));
-    }
+      }
 #undef REDUCE_CASE
 #undef KL
   }

@@ -55,46 +55,55 @@ bool _is_weak_contiguous(torch::Tensor& t) {
  * Otherwise, _reg_buffer is assumed to be IPC-registered and inp is first
  * copied into _reg_buffer.
  */
-void collective_comm(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, fptr_t _reg_buffer, int64_t reg_buffer_sz_bytes,
- sglang::CommOpType op_type=sglang::CommOpType::ALL_REDUCE) {
-  auto fa = reinterpret_cast<sglang::CustomAllreduce*>(_fa);
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(inp));
-  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+void collective_comm(
+    fptr_t _fa, torch::Tensor &inp, torch::Tensor &out, fptr_t _reg_buffer, int64_t reg_buffer_sz_bytes,
+    sglang::CommOpType op_type = sglang::CommOpType::ALL_REDUCE, float eps = 1e-6) {
+    auto fa = reinterpret_cast<sglang::CustomAllreduce *>(_fa);
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(inp));
+    auto stream = c10::cuda::getCurrentCUDAStream().stream();
 
-  TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
-  if (op_type == sglang::CommOpType::REDUCE_SCATTER) {
-    TORCH_CHECK_EQ(inp.numel(), out.numel() * fa->world_size_);
-  } else if (op_type == sglang::CommOpType::ALL_GATHER) {
-    TORCH_CHECK_EQ(inp.numel()*fa->world_size_, out.numel());
-  }else{
-    TORCH_CHECK_EQ(inp.numel(), out.numel());
-  }
-  TORCH_CHECK(_is_weak_contiguous(out));
-  TORCH_CHECK(_is_weak_contiguous(inp));
-  auto input_size = inp.numel() * inp.element_size();
-  auto reg_buffer = reinterpret_cast<void*>(_reg_buffer);
-  if (reg_buffer) {
-    TORCH_CHECK_LE(input_size, reg_buffer_sz_bytes);
-    AT_CUDA_CHECK(cudaMemcpyAsync(reg_buffer, inp.data_ptr(), input_size, cudaMemcpyDeviceToDevice, stream));
-  } else {
-    reg_buffer = inp.data_ptr();
-  }
-
-  auto num_elems_to_comm = op_type == sglang::CommOpType::REDUCE_SCATTER ? out.numel() * fa->world_size_ : out.numel();
-
-#define CALL(T) \
-    if (op_type == sglang::CommOpType::REDUCE_SCATTER) { \
-      fa->collective_comm<T, sglang::CommOpType::REDUCE_SCATTER>( \
-          stream, reinterpret_cast<T*>(reg_buffer), reinterpret_cast<T*>(out.data_ptr()), num_elems_to_comm); \
-    } else if (op_type == sglang::CommOpType::ALL_REDUCE) { \
-      fa->collective_comm<T, sglang::CommOpType::ALL_REDUCE>( \
-          stream, reinterpret_cast<T*>(reg_buffer), reinterpret_cast<T*>(out.data_ptr()), num_elems_to_comm); \
-    } else if (op_type == sglang::CommOpType::ALL_GATHER) { \
-      fa->collective_comm<T, sglang::CommOpType::ALL_GATHER>( \
-          stream, reinterpret_cast<T*>(reg_buffer), reinterpret_cast<T*>(out.data_ptr()), num_elems_to_comm); \
+    TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
+    if (op_type == sglang::CommOpType::REDUCE_SCATTER || op_type == sglang::CommOpType::FUSED_REDUCE_SCATTER_NORM) {
+        TORCH_CHECK_EQ(inp.numel(), out.numel() * fa->world_size_);
+    } else if (op_type == sglang::CommOpType::ALL_GATHER) {
+        TORCH_CHECK_EQ(inp.numel() * fa->world_size_, out.numel());
+    } else {
+        TORCH_CHECK_EQ(inp.numel(), out.numel());
+    }
+    TORCH_CHECK(_is_weak_contiguous(out));
+    TORCH_CHECK(_is_weak_contiguous(inp));
+    auto input_size = inp.numel() * inp.element_size();
+    auto reg_buffer = reinterpret_cast<void *>(_reg_buffer);
+    if (reg_buffer) {
+        TORCH_CHECK_LE(input_size, reg_buffer_sz_bytes);
+        AT_CUDA_CHECK(cudaMemcpyAsync(reg_buffer, inp.data_ptr(), input_size, cudaMemcpyDeviceToDevice, stream));
+    } else {
+        reg_buffer = inp.data_ptr();
     }
 
-  switch (out.scalar_type()) {
+    auto num_elems_to_comm =
+        op_type == sglang::CommOpType::REDUCE_SCATTER || op_type == sglang::CommOpType::FUSED_REDUCE_SCATTER_NORM ?
+            out.numel() * fa->world_size_ :
+            out.numel();
+
+#define CALL(T)                                                                                                     \
+    if (op_type == sglang::CommOpType::REDUCE_SCATTER) {                                                            \
+        fa->collective_comm<T, sglang::CommOpType::REDUCE_SCATTER>(                                                 \
+            stream, reinterpret_cast<T *>(reg_buffer), reinterpret_cast<T *>(out.data_ptr()), num_elems_to_comm);   \
+    } else if (op_type == sglang::CommOpType::ALL_REDUCE) {                                                         \
+        fa->collective_comm<T, sglang::CommOpType::ALL_REDUCE>(                                                     \
+            stream, reinterpret_cast<T *>(reg_buffer), reinterpret_cast<T *>(out.data_ptr()), num_elems_to_comm);   \
+    } else if (op_type == sglang::CommOpType::ALL_GATHER) {                                                         \
+        fa->collective_comm<T, sglang::CommOpType::ALL_GATHER>(                                                     \
+            stream, reinterpret_cast<T *>(reg_buffer), reinterpret_cast<T *>(out.data_ptr()), num_elems_to_comm);   \
+    } else if (op_type == sglang::CommOpType::FUSED_REDUCE_SCATTER_NORM) {                                          \
+        int n = inp.sizes().back();                                                                                 \
+        fa->collective_comm<T, sglang::CommOpType::FUSED_REDUCE_SCATTER_NORM>(                                      \
+            stream, reinterpret_cast<T *>(reg_buffer), reinterpret_cast<T *>(out.data_ptr()), num_elems_to_comm, 0, \
+            64, n, eps);                                                                                            \
+    }
+
+    switch (out.scalar_type()) {
     case at::ScalarType::Float: {
       CALL(float);
       break;
@@ -111,7 +120,7 @@ void collective_comm(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, fptr_t 
 #endif
     default:
       throw std::runtime_error("custom allreduce only supports float32, float16 and bfloat16");
-  }
+    }
 }
 
 void reduce_scatter(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, fptr_t _reg_buffer, int64_t reg_buffer_sz_bytes) {
@@ -126,6 +135,11 @@ void all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, fptr_t _reg_
   return collective_comm(_fa, inp, out, _reg_buffer, reg_buffer_sz_bytes, sglang::CommOpType::ALL_REDUCE);
 }
 
+void fused_reduce_scatter_norm(
+    fptr_t _fa, torch::Tensor &inp, torch::Tensor &out, fptr_t _reg_buffer, int64_t reg_buffer_sz_bytes, double eps) {
+    return collective_comm(
+        _fa, inp, out, _reg_buffer, reg_buffer_sz_bytes, sglang::CommOpType::FUSED_REDUCE_SCATTER_NORM, float(eps));
+}
 
 void dispose(fptr_t _fa) {
   delete reinterpret_cast<sglang::CustomAllreduce*>(_fa);
@@ -185,6 +199,11 @@ TORCH_LIBRARY_FRAGMENT(my_ar, m) {
   m.def("reduce_scatter(int fa, Tensor inp, Tensor! out, int reg_buffer, "
       "int reg_buffer_sz_bytes) -> ()");
   m.impl("reduce_scatter", torch::kCUDA, &reduce_scatter);
+
+  m.def(
+      "fused_reduce_scatter_norm(int fa, Tensor inp, Tensor! out, int reg_buffer, "
+      "int reg_buffer_sz_bytes, float eps) -> ()");
+  m.impl("fused_reduce_scatter_norm", torch::kCUDA, &fused_reduce_scatter_norm);
 
   m.def("all_gather(int fa, Tensor inp, Tensor! out, int reg_buffer, "
       "int reg_buffer_sz_bytes) -> ()");
